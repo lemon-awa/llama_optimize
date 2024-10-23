@@ -31,7 +31,7 @@ class Alpaca(DataModule):
     """The index to use for elements to be ignored in the label."""
     seed: int = 42
     """The random seed for creating the train/val splits and shuffling the dataset."""
-    num_workers: int = 4
+    num_workers: int = 6
     """How many DataLoader processes to use for loading."""
     download_dir: Path = Path("./data/alpaca")
     """The directory in which the downloaded dataset gets saved."""

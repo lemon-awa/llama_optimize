@@ -21,7 +21,7 @@ from typing_extensions import Literal
 from litgpt import Tokenizer
 from litgpt.args import EvalArgs, TrainArgs
 from litgpt.config import name_to_config
-from litgpt.data import DataModule, TinyLlama
+from litgpt.data import DataModule, TinyLlama, Alpaca, FLAN
 from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
 from litgpt.utils import (
     CycleIterator,
@@ -41,7 +41,10 @@ from litgpt.utils import (
     save_config,
     save_hyperparameters,
 )
-
+import wandb
+import yaml
+import random
+import numpy as np
 
 def setup(
     model_name: str,
@@ -52,17 +55,17 @@ def setup(
     resume: Union[bool, Literal["auto"], Path] = False,
     data: Optional[DataModule] = None,
     train: TrainArgs = TrainArgs(
-        save_interval=1000,
+        save_interval=10000,
         log_interval=1,
-        global_batch_size=512,
-        micro_batch_size=4,
+        global_batch_size=36,
+        micro_batch_size=6,
         max_tokens=int(3e12),  # 3 trillion
         max_norm=1.0,
         min_lr=4e-5,
         lr_warmup_steps=2000,
         tie_embeddings=False,
     ),
-    eval: EvalArgs = EvalArgs(interval=1000, max_iters=100),
+    eval: EvalArgs = EvalArgs(interval=100, max_iters=100),
     optimizer: Union[str, Dict] = "AdamW",
     devices: Union[int, str] = "auto",
     num_nodes: int = 1,
@@ -233,7 +236,7 @@ def main(
         fabric.load(resume, state)
 
     train_time = time.perf_counter()
-    fit(fabric, devices, state, train_dataloader, val_dataloader, out_dir, tokenizer_dir, train, eval)
+    fit(fabric, devices, state, train_dataloader, val_dataloader, out_dir, tokenizer_dir, train, eval, config, tokenizer)
 
     # Save final checkpoint
     save_checkpoint(fabric, state, tokenizer_dir, out_dir / "final" / "lit_model.pth")
@@ -253,7 +256,14 @@ def fit(
     tokenizer_dir: Optional[Path],
     train: TrainArgs,
     eval: EvalArgs,
+    config: Config,
+    tokenizer: Tokenizer,
+    wandb_log : bool = True,
+    wandb_project : str = 'llama_optimize',
+    wandb_run_name : str = 'llama_3b_full_pretrain_alpaca_ori',
 ) -> None:
+    if fabric.global_rank == 0 and wandb_log:
+        wandb.init(project=wandb_project, name=wandb_run_name, config=config)
     model = state["model"]
     optimizer = state["optimizer"]
 
@@ -303,8 +313,9 @@ def fit(
         state["iter_num"] += 1
         iter_t0 = time.perf_counter()
 
-        input_ids = train_data[:, 0 : model.max_seq_length].contiguous().long()
-        targets = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
+        input_ids = train_data["input_ids"][:,:-1].contiguous().long()
+        targets = train_data["labels"][:, 1 : ].contiguous().long()
+        # fabric.print(f"{tokenizer.decode(input_ids[0])} ")
 
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
@@ -331,8 +342,9 @@ def fit(
                 lengths=(state["iter_num"] * train.micro_batch_size * model.max_seq_length),
             )
             metrics = {
-                "loss": loss,
-                "iter": state["iter_num"],
+                "train/loss": loss,
+                "train/ppl": math.exp(loss),
+                "train/iter": state["iter_num"],
                 "step": state["step_count"],
                 "epoch": train_iterator.epoch,
                 "iter_time": t1 - iter_t0,
@@ -346,13 +358,16 @@ def fit(
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
             fabric.print(
-                f"Epoch {metrics['epoch']+1} | iter {metrics['iter']} step {metrics['step']} |"
-                f" loss train: {metrics['loss']:.3f},"
+                f"Epoch {metrics['epoch']+1} | iter {metrics['train/iter']} step {metrics['step']} |"
+                f" loss train: {metrics['train/loss']:.3f},"
+                f" ppl train: {metrics['train/ppl']:.3f},"
                 f" val: {val_loss} |"
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
                 f"{' (step)' if not is_accumulating else ''}"
                 f" remaining time: {timedelta(seconds=int(metrics['remaining_time']))!s}"
             )
+            if fabric.global_rank == 0 and wandb_log:
+                    wandb.log(metrics, step=state["step_count"])
 
             throughput_metrics = throughput.compute()
             metrics.update(throughput_metrics)
@@ -365,8 +380,10 @@ def fit(
             td = time.perf_counter() - t0
 
             fabric.print(f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms")
-            metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+            metrics = {"val/loss": val_loss, "val/ppl": math.exp(val_loss)}
             fabric.log_dict(metrics, step=state["iter_num"] - 1)
+            if fabric.global_rank == 0 and wandb_log:
+                wandb.log(metrics, step=state["step_count"])
             fabric.barrier()
 
         if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
@@ -391,8 +408,9 @@ def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max
     for k, batch in enumerate(val_dataloader):
         if k >= max_iters:
             break
-        input_ids = batch[:, 0 : model.max_seq_length].contiguous().long()
-        targets = batch[:, 1 : (model.max_seq_length + 1)].contiguous().long()
+        # fabric.print(f"Validating batch {batch}")
+        input_ids = batch["input_ids"][:,:-1].contiguous().long()
+        targets = batch["labels"][:, 1 : ].contiguous().long()
         logits = model(input_ids)
         loss = chunked_cross_entropy(logits, targets)
         losses.append(loss)
@@ -480,3 +498,29 @@ def validate_args(train: TrainArgs, eval: EvalArgs, initial_checkpoint_dir, resu
         issues.append("Can't provide both `--resume` and `--initial_checkpoint_dir`. Choose one.")
     if issues:
         raise ValueError("\n".join(issues))
+
+def load_config(config_path):
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    return config
+
+if __name__ == "__main__":
+    config = load_config("config_hub/finetune/llama-3.2-3B/full.yaml")
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    setup(
+        model_name="meta-llama/Llama-3.2-3B",
+        tokenizer_dir=Path("checkpoints/meta-llama/Llama-3.2-3B"),
+        out_dir=Path(config.get("out_dir", "out/finetune/pretrain")),
+        precision=config.get("precision", "bf16-true"),
+        devices=config.get("devices", 1),
+        num_nodes=config.get("num_nodes", 1),
+        resume=config.get("resume", False),
+        data=Alpaca(),
+        optimizer=config.get("optimizer", "AdamW"),
+        logger_name=config.get("logger_name", "csv"),
+        seed=seed,
+    )

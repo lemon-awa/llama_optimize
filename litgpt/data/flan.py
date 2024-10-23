@@ -69,10 +69,31 @@ class FLAN(DataModule):
     def prepare_data(self) -> None:
         self.download_dir.mkdir(parents=True, exist_ok=True)
         for subset in self.subsets:
+            # longest_overall = {"split": None, "data": None, "length": 0}
             for split in ("train", "test"):
                 data_file_path = self.download_dir / f"{subset}_{split}.jsonl"
                 data_file_url = f"{self.url}/{split}/{subset}_{split}.jsonl"
                 download_if_missing(data_file_path, data_file_url)
+    #             data = self._load_jsonl(data_file_path)
+
+    #             # 找出 inputs + targets 最长的数据
+    #             longest_data = max(
+    #                 data, 
+    #                 key=lambda x: len(x.get("inputs", "")) + len(x.get("targets", ""))
+    #             )
+    #             total_length = len(longest_data.get("inputs", "")) + len(longest_data.get("targets", ""))
+    #             print(f"Longest data in {data_file_path}:")
+    #             print(f"Inputs + Targets Length: {total_length}")
+
+
+    #     breakpoint()
+
+    # def _load_jsonl(self, path: Path) -> List[Dict[str, str]]:
+    #     data = []
+    #     with open(path, "r", encoding="utf-8") as f:
+    #         for line in f:
+    #             data.append(json.loads(line))
+    #     return data
 
     def train_dataloader(self):
         return self._dataloader("train")
@@ -114,6 +135,8 @@ def load_jsonl(filename: Path) -> List[Dict[str, str]]:
 
 
 def _transform(item: dict) -> dict:
+    if "instruction" in item and "output" in item:
+        return item
     item["instruction"] = item.pop("inputs")
     item["output"] = item.pop("targets")
     return item
@@ -121,7 +144,6 @@ def _transform(item: dict) -> dict:
 
 def _supported_subsets() -> Set[str]:
     return {
-        "aeslc_10templates",
         "ag_news_subset_10templates",
         "anli_r1_10templates",
         "anli_r2_10templates",
@@ -130,7 +152,6 @@ def _supported_subsets() -> Set[str]:
         "arc_easy_10templates",
         "bool_q_10templates",
         "cb_10templates",
-        "cnn_dailymail_10templates",
         "cola_10templates",
         "common_gen_10templates",
         "copa_10templates",
@@ -145,11 +166,9 @@ def _supported_subsets() -> Set[str]:
         "glue_mrpc_10templates",
         "glue_qqp_10templates",
         "hellaswag_10templates",
-        "imdb_reviews_10templates",
         "math_dataset_10templates",
         "mnli_matched_10templates",
         "mnli_mismatched_10templates",
-        "multi_news_10templates",
         "multirc_10templates",
         "natural_questions_10templates",
         "openbookqa_10templates",
@@ -159,14 +178,11 @@ def _supported_subsets() -> Set[str]:
         "paws_wiki_10templates",
         "piqa_10templates",
         "qnli_10templates",
-        "quac_10templates",
         "record_10templates",
         "rte_10templates",
         "samsum_10templates",
         "sentiment140_10templates",
         "snli_10templates",
-        "squad_v1_10templates",
-        "squad_v2_10templates",
         "sst2_10templates",
         "story_cloze_10templates",
         "stsb_10templates",
@@ -175,9 +191,6 @@ def _supported_subsets() -> Set[str]:
         "true_case_10templates",
         "web_nlg_en_10templates",
         "wic_10templates",
-        "wiki_lingua_english_en_10templates",
-        "wmt14_enfr_10templates",
-        "wmt16_translate_csen_10templates",
         "wmt16_translate_deen_10templates",
         "wmt16_translate_fien_10templates",
         "wmt16_translate_roen_10templates",

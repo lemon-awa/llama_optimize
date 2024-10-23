@@ -71,6 +71,8 @@ class Dolly(Alpaca):
 
 
 def _transform(item: dict) -> dict:
+    if "input" in item and "output" in item:
+        return item
     item["input"] = item.get("context", "")
     item["output"] = item.get("response", "")
     return item

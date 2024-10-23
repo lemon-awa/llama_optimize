@@ -9,7 +9,8 @@ from torch.utils.data import DataLoader
 
 from litgpt.tokenizer import Tokenizer
 from litgpt.data import DataModule
-
+import os
+os.environ["HF_HOME"]="/scratch/oymak_owned_root/oymak_owned1/xziyang/cache/huggingface/"
 
 @dataclass
 class OpenWebText(DataModule):

@@ -14,6 +14,230 @@ import torch.nn as nn
 from typing_extensions import Self
 
 from litgpt.config import Config
+import torch.utils.checkpoint as checkpoint
+
+class Embed_Attention(nn.Module):
+    def __init__(self, config: Config, block_idx: int) -> None:
+        super().__init__()
+        # shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
+        self.k_proj = nn.Linear(2 * config.n_embd, config.n_query_groups * config.head_size, bias=config.bias)
+        self.v_proj = nn.Linear(2 * config.n_embd, config.n_query_groups * config.head_size, bias=config.bias)
+        self.q_proj = nn.Linear(config.n_embd, config.n_head * config.head_size, bias=config.bias)
+        # output projection
+        # if `head_size` is explicitly specified in the config, `n_emd` might not be equal to `head_size * n_head`
+        self.proj = nn.Linear(config.head_size * config.n_head, config.n_embd, bias=config.bias)
+        # disabled by default
+        self.kv_cache: Optional[KVCache] = None
+        self.apply_sliding_window_attention = (
+            config.sliding_window_size is not None and
+            block_idx % config.sliding_window_layer_placing == 0
+        )
+
+        self.config = config
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, T, C = x.size()
+        if C == 2 * self.config.n_embd:
+            x_current = x[:, :, :self.config.n_embd]  # Current input
+            x_concat = x  # Use concatenated input for K and V
+        # else:
+        #     x_current = x
+        #     x_concat = torch.cat([torch.zeros_like(x), x], dim=-1)  # Pad with zeros
+
+        # qkv = self.attn(x)
+
+        # # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
+        # q_per_kv = self.config.n_head // self.config.n_query_groups
+        # total_qkv = q_per_kv + 2  # each group has 1+ queries, 1 key, and 1 value
+        # qkv = qkv.view(B, T, self.config.n_query_groups, total_qkv, self.config.head_size)
+        # qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, n_query_groups, total_qkv, T, hs)
+
+        # # split batched computation into three
+        # q, k, v = qkv.split((q_per_kv, 1, 1), dim=2)
+
+        # # maybe repeat k and v if for the non multi-head attention cases
+        # # training: flash attention requires it
+        # # inference: multi-query would require a full kv cache so avoid it to limit its memory usage
+        # if self.config.n_query_groups != self.config.n_head and (input_pos is None or self.config.n_query_groups != 1):
+        #     k = k.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
+        #     v = v.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
+        q = self.q_proj(x_current)  # [B, T, n_head * head_size]
+        k = self.k_proj(x_concat)   # [B, T, 2*n_head * head_size]
+        v = self.v_proj(x_concat)   # [B, T, 2*n_head * head_size]
+
+        q = q.view(B, T, self.config.n_head, self.config.head_size).transpose(1, 2)  # [B, n_head, T, head_size]
+        k = k.view(B, T, self.config.n_query_groups, self.config.head_size).transpose(1, 2)  # [B, n_query_groups, T, head_size]
+        v = v.view(B, T, self.config.n_query_groups, self.config.head_size).transpose(1, 2)  # [B, n_query_groups, T, head_size]
+
+        # Repeat K and V to match the number of heads if necessary
+        if self.config.n_query_groups != self.config.n_head:
+            repeat_factor = self.config.n_head // self.config.n_query_groups
+            k = k.repeat_interleave(repeat_factor, dim=1)  # [B, n_head, T, head_size]
+            v = v.repeat_interleave(repeat_factor, dim=1)  # [B, n_head, T, head_size]
+
+        # q = q.reshape(B, -1, T, self.config.head_size)  # (B, nh_q, T, hs)
+        # k = k.reshape(B, -1, T, self.config.head_size)  # (B, nh_k, T, hs)
+        # v = v.reshape(B, -1, T, self.config.head_size)  # (B, nh_v, T, hs)
+
+        q_roped = apply_rope(q[..., : self.config.rope_n_elem], cos, sin)
+        k_roped = apply_rope(k[..., : self.config.rope_n_elem], cos, sin)
+        q = torch.cat((q_roped, q[..., self.config.rope_n_elem :]), dim=-1)
+        k = torch.cat((k_roped, k[..., self.config.rope_n_elem :]), dim=-1)
+
+        if input_pos is not None:
+            if not isinstance(self.kv_cache, KVCache):
+                raise TypeError("You need to call `gpt.set_kv_cache()`")
+            k, v = self.kv_cache(input_pos, k, v)
+
+        if self.apply_sliding_window_attention:
+            """
+                  Global Window              Sliding window             Sliding window
+                  attention mask      +            bias          =      attention mask
+            ┌────────────────────────┐  ┌───────────────────────┐  ┌─────────────────────────┐
+            │ True False False False │  │ True  True  True True │  │ True  False False False │
+            │ True True  False False │  │ True  True  True True │  │ True  True  False False │
+            │ True True  True  False │  │ False True  True True │  │ False True  True  False │
+            │ True True  True  True  │  │ False False True True │  │ False False True  True  │
+            └────────────────────────┘  └───────────────────────┘  └─────────────────────────┘
+            """
+            if mask is None:
+                mask = torch.ones(T, T, dtype=q.dtype, device=q.device).triu(diagonal=1)
+                mask.masked_fill_(mask.bool(), float("-inf"))
+            sliding_window_bias = torch.ones_like(mask).tril(diagonal=-self.config.sliding_window_size)
+            sliding_window_bias.masked_fill_(sliding_window_bias.bool(), float("-inf"))
+            mask += sliding_window_bias
+
+        y = self.scaled_dot_product_attention(q, k, v, mask)
+
+        y = y.reshape(B, T, self.config.head_size * self.config.n_head)  # re-assemble all head outputs side by side
+
+        # output projection
+        return self.proj(y)
+    def scaled_dot_product_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
+
+        # with softcapping we cannot use SDPA
+        if self.config.attention_logit_softcapping is not None:
+            scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
+            scores = q @ k.mT * scale
+            scores = (
+                torch.tanh(scores / self.config.attention_logit_softcapping) * self.config.attention_logit_softcapping
+            )
+            if mask is None:
+                mask = torch.ones(q.size(2), q.size(2), dtype=q.dtype, device=q.device).triu(diagonal=1)
+                mask.masked_fill_(mask.bool(), torch.finfo(q.dtype).min)
+            scores = scores + mask
+            scores = torch.nn.functional.softmax(scores, dim=-1, dtype=torch.float).to(dtype=q.dtype)
+            y = scores @ v
+        else:
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
+            )
+        return y.transpose(1, 2)
+
+    def build_kv_cache(
+        self,
+        batch_size: int,
+        max_seq_length: int,
+        rope_cache_length: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> "KVCache":
+        heads = 1 if self.config.n_query_groups == 1 else self.config.n_head
+        v_shape = (batch_size, heads, max_seq_length, self.config.head_size)
+        if rope_cache_length is None:
+            if self.config.rotary_percentage != 1.0:
+                raise TypeError("Please pass the `rope_cache_length=gpt.cos.size(-1)` value")
+            k_shape = v_shape
+        else:
+            k_shape = (
+                batch_size,
+                heads,
+                max_seq_length,
+                rope_cache_length + self.config.head_size - self.config.rope_n_elem,
+            )
+        return KVCache(k_shape, v_shape, device=device, dtype=dtype)
+
+
+class Add_Block(nn.Module):
+    def __init__(self, config: Config, block_idx: int) -> None:
+        super().__init__()
+        if not config.parallel_residual and config.shared_attention_norm:
+            raise NotImplementedError(
+                "No checkpoint amongst the ones we support uses this configuration"
+                " (non-parallel residual and shared attention norm)."
+            )
+
+        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.attn = Embed_Attention(config, block_idx)
+        self.post_attention_norm = (
+            config.norm_class(config.n_embd, eps=config.norm_eps) if config.post_attention_norm else nn.Identity()
+        )
+        self.norm_2 = None if config.shared_attention_norm else config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.mlp = config.mlp_class(config)
+        self.post_mlp_norm = (
+            config.norm_class(config.n_embd, eps=config.norm_eps) if config.post_mlp_norm else nn.Identity()
+        )
+
+        self.config = config
+        self.previous_output = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Non-parallel residual       Parallel residual
+           ┌─ x                     ┌─ x ──────────────────┐             Note: if `shared_attention_norm` is True,
+           │  ↓                     │  ↓                   ↓                   the output from `norm_1` is reused
+           │  norm_1                │  norm_1  ───────►    norm_2
+           │  ↓                     │  ↓                   ↓
+           │  attn                  │  attn                MLP
+           │  ↓                     │  ↓                   ↓
+           |  post_attn_norm        |  post_attn_norm      post_mlp_norm
+           |  ↓                     |  ↓                   ↓
+        ┌─ └► +                     └► + ◄─────────────────┘
+        |     ↓
+        │     norm_2
+        │     ↓
+        │     MLP
+        │     ↓
+        |     post_mlp_norm
+        |     ↓
+        └───► +
+        """
+        x_normed = self.norm_1(x)
+        if self.previous_output is not None:
+            B, L, d = self.previous_output.shape
+            zero_pad = torch.zeros(B, 1, d, device=self.previous_output.device, dtype=self.previous_output.dtype)
+            self.previous_output = torch.cat([zero_pad, self.previous_output[:,:-1,:]], dim=1)
+            prev_normed = self.norm_1(self.previous_output)
+            x_normed = torch.cat([x_normed, prev_normed], dim=-1)  # (L, 2d)
+        else:
+            x_normed = torch.cat([x_normed, torch.zeros_like(x_normed)], dim=-1)  # (L, 2d)
+        attention_output = self.attn(x_normed, cos, sin, mask, input_pos)
+        attention_output = self.post_attention_norm(attention_output)
+
+        if self.config.parallel_residual:
+            x_normed = x_normed if self.config.shared_attention_norm else self.norm_2(x)
+            x = self.mlp(x_normed) + attention_output + x
+        else:
+            x = attention_output + x
+            x = self.post_mlp_norm(self.mlp(self.norm_2(x))) + x
+        return x
 
 
 class GPT(nn.Module):
@@ -26,13 +250,14 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
+                # h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
+                h=nn.ModuleList([Add_Block(config, 0)] + [Block(config, block_idx) for block_idx in range(1,config.n_layer)]),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
         self.max_seq_length = self.config.block_size
         self.mask_cache: Optional[torch.Tensor] = None
-
+        self.forward_times = 1
     @property
     def max_seq_length(self) -> int:
         return self._max_seq_length
@@ -95,8 +320,21 @@ class GPT(nn.Module):
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
 
-        for block in self.transformer.h:
-            x = block(x, cos, sin, mask, input_pos)
+        # MAIN FIX 
+        if isinstance(self.transformer.h[0], Add_Block):
+            self.transformer.h[0].previous_output = None
+            x_add = x
+            with torch.no_grad():
+                for block in self.transformer.h:
+                    x_add = block(x_add, cos, sin, mask, input_pos)
+            for i in range(self.forward_times):
+                self.transformer.h[0].previous_output = x_add.detach()
+                for block in self.transformer.h:
+                    x = block(x, cos, sin, mask, input_pos)
+            self.transformer.h[0].previous_output = None
+        else:
+            for block in self.transformer.h:
+                x = block(x, cos, sin, mask, input_pos)
         x = self.transformer.ln_f(x)
         x = self.lm_head(x)  # (b, t, vocab_size)
         if self.config.final_logit_softcapping is not None:

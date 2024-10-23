@@ -59,7 +59,7 @@ def setup(
         epochs=5,
         max_seq_length=None,
     ),
-    eval: EvalArgs = EvalArgs(interval=50, max_new_tokens=100, max_iters=100),
+    eval: EvalArgs = EvalArgs(interval=10, max_new_tokens=100, max_iters=100),
     optimizer: Union[str, Dict] = "AdamW",
     logger_name: Literal["wandb", "tensorboard", "csv"] = "csv",
     seed: int = 1337,
@@ -142,9 +142,9 @@ def main(
     tokenizer = Tokenizer(checkpoint_dir)
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train)
     first_batch = next(iter(train_dataloader))
-    # fabric.print("First Batch:")
-    # for key, value in first_batch.items():
-    #     fabric.print(f"{key}: {value}")
+    fabric.print("First Batch:")
+    for key, value in first_batch.items():
+        fabric.print(f"{key}: {value}")
     fabric.print(f"len(train_dataloader): {len(train_dataloader)}")
     steps_per_epoch = len(train_dataloader) // train.gradient_accumulation_iters(devices)
     lr_max_steps = min(train.epochs * steps_per_epoch, (train.max_steps or float("inf")))
@@ -211,9 +211,9 @@ def fit(
     eval: EvalArgs,
     data: DataModule,
     config: Config,
-    wandb_log : bool = True,
+    wandb_log : bool = False,
     wandb_project : str = 'llama_optimize',
-    wandb_run_name : str = 'Llama_7b_full_flan_pretrain_embed',
+    wandb_run_name : str = 'Llama_7b_full_flan_embed',
 ) -> None:
     if fabric.global_rank == 0 and wandb_log:
         wandb.init(project=wandb_project, name=wandb_run_name, config=config)
@@ -221,14 +221,14 @@ def fit(
     optimizer = state["optimizer"]
     scheduler = state["scheduler"]
     tokenizer = Tokenizer(checkpoint_dir)
-    # first_batch = next(iter(train_dataloader))
-    # fabric.print("First Batch:")
-    # for key, value in first_batch.items():
-    #     fabric.print(f"{key}: {value}")
-    # first_batch = next(iter(val_dataloader))
-    # fabric.print("First Batch val:")
-    # for key, value in first_batch.items():
-    #     fabric.print(f"{key}: {value}")
+    first_batch = next(iter(train_dataloader))
+    fabric.print("First Batch:")
+    for key, value in first_batch.items():
+        fabric.print(f"{key}: {value}")
+    first_batch = next(iter(val_dataloader))
+    fabric.print("First Batch val:")
+    for key, value in first_batch.items():
+        fabric.print(f"{key}: {value}")
     longest_seq_length, longest_seq_ix = get_longest_seq_length(ConcatDataset([train_dataloader.dataset, val_dataloader.dataset]))
     model.max_seq_length = min(longest_seq_length, train.max_seq_length or float("inf"))
     fabric.print(
@@ -303,7 +303,6 @@ def fit(
             t1 = time.perf_counter()
             metrics = {
                 "train/loss": loss,
-                "train/ppl": math.exp(loss),
                 "train/iter": state["iter_num"],
                 "train/step": state["step_count"],
                 "train/epoch": train_iterator.epoch,
@@ -319,7 +318,6 @@ def fit(
             fabric.print(
                 f"Epoch {metrics['train/epoch']+1} | iter {metrics['train/iter']} step {metrics['train/step']} |"
                 f" loss train: {metrics['train/loss']:.3f},"
-                f" ppl train: {metrics['train/ppl']:.3},"
                 f" val: {val_loss} |"
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
                 f"{' (step)' if not is_accumulating else ''}"
@@ -334,7 +332,7 @@ def fit(
             generate_example(fabric, model, tokenizer, eval, data)
             t1 = time.perf_counter() - t0
             fabric.print(f"iter {state['iter_num']}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f} ms")
-            metrics = {"val/loss": val_loss, "val/ppl": math.exp(val_loss)}
+            metrics = {"val/val_loss": val_loss, "val/val_ppl": math.exp(val_loss)}
             fabric.log_dict(metrics, step=state["iter_num"])
             if fabric.global_rank == 0 and wandb_log:
                 wandb.log(metrics, step=state["iter_num"])

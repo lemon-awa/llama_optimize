@@ -374,12 +374,11 @@ def get_default_supported_precision(training: bool) -> str:
 
 def load_checkpoint(fabric: L.Fabric, model: nn.Module, checkpoint_path: Path, strict: bool = True) -> None:
     if isinstance(fabric.strategy, FSDPStrategy):
-        fabric.load_raw(checkpoint_path, model, strict=strict)
+        fabric.load_raw(checkpoint_path, model, strict=False)
     else:
         state_dict = lazy_load(checkpoint_path)
         state_dict = state_dict.get("model", state_dict)
-        model.load_state_dict(state_dict, strict=strict)
-
+        model.load_state_dict(state_dict, strict=strict)  
 
 def flops_per_param(max_seq_length: int, n_layer: int, n_embd: int, n_params: int) -> int:
     flops_per_token = 2 * n_params  # each parameter is used for a MAC (2 FLOPS) per network operation

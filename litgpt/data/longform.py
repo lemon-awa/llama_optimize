@@ -86,5 +86,7 @@ class LongForm(DataModule):
 
 
 def _transform(item: dict) -> dict:
+    if "instruction" in item:
+        return item
     item["instruction"] = item.pop("input")
     return item

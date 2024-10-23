@@ -41,7 +41,7 @@ from litgpt.utils import (
     parse_devices,
     save_hyperparameters,
 )
-
+import wandb
 
 def setup(
     checkpoint_dir: Path,
@@ -69,7 +69,7 @@ def setup(
         epochs=5,
         max_seq_length=None,
     ),
-    eval: EvalArgs = EvalArgs(interval=100, max_new_tokens=100, max_iters=100),
+    eval: EvalArgs = EvalArgs(interval=50, max_new_tokens=100, max_iters=100),
     optimizer: Union[str, Dict] = "AdamW",
     logger_name: Literal["wandb", "tensorboard", "csv"] = "csv",
     seed: int = 1337,
@@ -234,6 +234,7 @@ def main(
         train,
         eval,
         data,
+        config,
     )
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
@@ -271,7 +272,13 @@ def fit(
     train: TrainArgs,
     eval: EvalArgs,
     data: DataModule,
+    config: Config,
+    wandb_log : bool = True,
+    wandb_project : str = 'llama_optimize',
+    wandb_run_name : str = 'Llama_lora_Alpaca_pretrain',
 ) -> None:
+    if fabric.global_rank == 0 and wandb_log:
+        wandb.init(project=wandb_project, name=wandb_run_name, config=config)
     tokenizer = Tokenizer(checkpoint_dir)
     longest_seq_length, longest_seq_ix = get_longest_seq_length(ConcatDataset([train_dataloader.dataset, val_dataloader.dataset]))
     model.max_seq_length = min(longest_seq_length, train.max_seq_length or float("inf"))
@@ -330,10 +337,10 @@ def fit(
             )
             throughput.compute_and_log(step=iter_num)
             metrics = {
-                "loss": loss,
-                "iter": iter_num,
-                "step": step_count,
-                "epoch": train_iterator.epoch,
+                "train/loss": loss,
+                "train/iter": iter_num,
+                "train/step": step_count,
+                "train/epoch": train_iterator.epoch,
                 "iter_time": t1 - iter_t0,
                 "tokens": iter_num * train.micro_batch_size * model.config.block_size,
                 "total_tokens": (iter_num * train.micro_batch_size * model.config.block_size * fabric.world_size),
@@ -342,13 +349,15 @@ def fit(
             if isinstance(val_loss, torch.Tensor):
                 val_loss = f"{val_loss:.3f}"
             fabric.print(
-                f"Epoch {metrics['epoch']+1} | iter {metrics['iter']} step {metrics['step']} |"
-                f" loss train: {metrics['loss']:.3f},"
+                f"Epoch {metrics['train/epoch']+1} | iter {metrics['train/iter']} step {metrics['train/step']} |"
+                f" loss train: {metrics['train/loss']:.3f},"
                 f" val: {val_loss} |"
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
                 f"{' (step)' if not is_accumulating else ''}"
             )
             fabric.log_dict(metrics, step=iter_num)
+            if fabric.global_rank == 0 and wandb_log:
+                wandb.log(metrics, step=iter_num)
 
         if not is_accumulating and step_count % eval.interval == 0:
             t0 = time.perf_counter()
@@ -359,6 +368,8 @@ def fit(
             metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
             fabric.log_dict(metrics, step=iter_num)
             fabric.barrier()
+            if fabric.global_rank == 0 and wandb_log:
+                wandb.log(metrics, step=iter_num)
 
         if train.save_interval is not None and not is_accumulating and step_count % train.save_interval == 0:
             checkpoint_file = out_dir / f"step-{step_count:06d}" / "lit_model.pth.lora"
@@ -384,6 +395,7 @@ def validate(fabric: L.Fabric, model: GPT, val_dataloader: DataLoader, eval: Eva
         logits = model(input_ids)
         losses[k] = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:], chunk_size=0)
 
+    fabric.print(f"Validation loss: {losses}")
     val_loss = losses.mean()
 
     model.train()
@@ -468,3 +480,10 @@ def validate_args(train: TrainArgs, eval: EvalArgs) -> None:
         issues.append(f"{__file__} requires either epochs or max_steps to be set. This is set in {train}")
     if issues:
         raise ValueError("\n".join(issues))
+
+if __name__ == "__main__":
+    seed = 42
+    setup(
+        checkpoint_dir=Path("/scratch/jiasi_root/jiasi0/xziyang/llama_optimize/checkpoints/meta-llama/Meta-Llama-3.1-8B-Instruct"),
+        devices=6,
+    )
